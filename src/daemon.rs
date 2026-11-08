@@ -253,6 +253,15 @@ impl Daemon<'_> {
         if schedule {
             self.schedule();
         }
+        if self.first_pass {
+            self.log.event(
+                "ready",
+                &[
+                    ("entries", v(self.reg.len())),
+                    ("watches", v(self.watched.len())),
+                ],
+            );
+        }
         self.first_pass = false;
     }
 
@@ -459,7 +468,7 @@ impl Daemon<'_> {
         let settle = Dur::from_std(self.cfg.settle);
         for (id, name, dir, via) in found {
             self.log.event(
-                "gone",
+                "dir_gone",
                 &[
                     ("name", v(name)),
                     ("dir", v(dir.display().to_string())),
