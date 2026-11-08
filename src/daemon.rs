@@ -59,14 +59,14 @@ enum Msg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Presence {
+pub enum Presence {
     Present,
     Absent,
 }
 
 /// Absent only on ENOENT/ENOTDIR. Anything else (EACCES, EIO, …) is an
 /// error, and an error never triggers a teardown.
-fn presence(path: &Path) -> std::io::Result<Presence> {
+pub fn presence(path: &Path) -> std::io::Result<Presence> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(Presence::Present),
         Err(e)

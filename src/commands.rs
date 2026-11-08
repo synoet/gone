@@ -292,13 +292,11 @@ fn list(store: &Store, json: bool) -> Result<i32> {
 
 fn state_text(e: &Entry, now: Ts) -> String {
     match e.state {
-        EntryState::Watching => {
-            if !e.dir.exists() && std::fs::symlink_metadata(&e.dir).is_err() {
-                "watching, dir is gone: the daemon will act".into()
-            } else {
-                "watching".into()
-            }
-        }
+        EntryState::Watching => match daemon::presence(&e.dir) {
+            Ok(daemon::Presence::Absent) => "watching, dir is gone: the daemon will act".into(),
+            Ok(daemon::Presence::Present) => "watching".into(),
+            Err(err) => format!("watching, cannot check dir: {err}"),
+        },
         EntryState::Triggered { gone_at } => {
             format!("triggered {} ago", approx(now.since(gone_at)))
         }
