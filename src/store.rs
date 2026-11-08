@@ -392,4 +392,24 @@ mod tests {
         let _l = rf.acquire().unwrap();
         assert!(rf.read_status().is_none());
     }
+
+    #[test]
+    fn a_v1_registry_on_disk_loads_and_is_rewritten_as_v2() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let v1 = r#"{"version": 1, "entries": [{"id": "a", "name": "a", "dir": "/w/a",
+            "cwd": "/", "steps": [{"cmd": {"argv": ["true"]}, "status": {"kind": "pending"}}],
+            "registered_at": "2026-11-08T18:00:00.000Z", "state": {"kind": "watching"}}]}"#;
+        fs::write(store.registry_path(), v1).unwrap();
+        assert_eq!(store.load().unwrap().entries[0].name, "a");
+        store
+            .update(|r| {
+                r.entries[0].name = "b".into();
+                Ok(())
+            })
+            .unwrap();
+        let text = fs::read_to_string(store.registry_path()).unwrap();
+        assert!(text.contains(r#""version": 2"#), "{text}");
+        assert!(!text.contains("pending"), "v1 step status is gone: {text}");
+    }
 }

@@ -510,3 +510,70 @@ fn steps_get_only_the_captured_env() {
         "{log}"
     );
 }
+
+#[test]
+fn stopped_daemon_leaves_the_step_running_for_the_next_one() {
+    let env = Env::new();
+    let wt = env.dir("wt");
+    let step = format!("sleep 1.5; {}", env.mark_step("m"));
+    env.watch(&wt, &["--shell", &step]);
+    let d = env.daemon(&["--shutdown-grace", "100ms"]);
+    std::fs::remove_dir_all(&wt).unwrap();
+    env.wait_for(WAIT, "the step to start", || env.count("step_start") == 1);
+    // A clean stop does not wait for, or kill, the running step.
+    d.stop();
+    let stop = env
+        .events()
+        .into_iter()
+        .rfind(|e| e["event"] == "daemon_stop")
+        .unwrap();
+    assert_eq!(stop["left_running"], 1);
+    env.wait_for(WAIT, "the step to finish on its own", || env.runs("m") == 1);
+    let _d = env.daemon(&[]);
+    env.wait_for(WAIT, "the next daemon to record it", || {
+        env.entry_state(0) == "done"
+    });
+    assert_eq!(env.count("step_recovered"), 1);
+    assert_eq!(env.runs("m"), 1);
+}
+
+#[test]
+fn interrupted_manual_run_rearms_the_registration() {
+    use std::os::unix::process::CommandExt;
+    let env = Env::new();
+    let wt = env.dir("wt");
+    let later = env.mark_step("later");
+    env.watch(
+        &wt,
+        &["--shell", "sleep 30", "--after", "1d", "--shell", &later],
+    );
+    // Like a terminal: gone run and its step share a process group, and
+    // Ctrl-C goes to the whole group.
+    let mut child = env
+        .cmd()
+        .args(["run", "wt"])
+        .process_group(0)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    env.wait_for(WAIT, "the step to start", || {
+        std::fs::read_dir(env.state().join("runs"))
+            .map(|d| {
+                d.flatten()
+                    .any(|f| f.path().extension().is_some_and(|x| x == "lock"))
+            })
+            .unwrap_or(false)
+            && env.entry_state(0) == "triggered"
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    // SAFETY: plain syscall on the child's own process group.
+    unsafe { libc::kill(-(child.id() as i32), libc::SIGINT) };
+    assert_eq!(child.wait().unwrap().code(), Some(130));
+    assert_eq!(
+        env.entry_state(0),
+        "watching",
+        "the rest is not left to the daemon"
+    );
+    assert_eq!(env.count("manual_run_interrupted"), 1);
+    assert_eq!(env.runs("later"), 0);
+}
