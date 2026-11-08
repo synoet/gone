@@ -438,10 +438,10 @@ impl Daemon<'_> {
     fn settle_foreign_claims(&mut self) {
         let now = Ts::now();
         for (id, step, claim) in self.core.foreign(&self.reg) {
-            let Some(gone_at) = self.entry(&id).and_then(|e| e.state.gone_at()) else {
+            let Some(trigger) = self.entry(&id).and_then(|e| e.state.trigger()) else {
                 continue;
             };
-            let files = self.store.run_files(&id, gone_at, step, claim.attempt);
+            let files = self.store.run_files(&id, trigger, step, claim.attempt);
             let probe = files.probe();
             let mut fields = self.fields(&id);
             fields.extend([
@@ -502,10 +502,10 @@ impl Daemon<'_> {
     fn start_due(&mut self) {
         let now = Ts::now();
         for (id, step, attempt) in self.core.due(&self.reg, now) {
-            let Some(gone_at) = self.entry(&id).and_then(|e| e.state.gone_at()) else {
+            let Some(trigger) = self.entry(&id).and_then(|e| e.state.trigger()) else {
                 continue;
             };
-            let files = self.store.run_files(&id, gone_at, step, attempt);
+            let files = self.store.run_files(&id, trigger, step, attempt);
             let lock = match files.acquire() {
                 Ok(l) => l,
                 Err(e) => {

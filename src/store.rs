@@ -5,7 +5,6 @@
 use crate::core::ClaimProbe;
 use crate::exec::StepStatus;
 use crate::model::Registry;
-use crate::time::Ts;
 use anyhow::{Context, Result, bail};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
@@ -69,11 +68,11 @@ impl Store {
         self.root.join("runs")
     }
 
-    /// The files of one attempt: `<id>-<gone_at ms>-step<N>-attempt<M>.*`
-    /// under `runs/`. The trigger time is part of the name so a later manual
+    /// The files of one attempt: `<id>-t<trigger>-step<N>-attempt<M>.*`
+    /// under `runs/`. The trigger number is part of the name so a later
     /// re-run of the same registration never reads an earlier status.
-    pub fn run_files(&self, id: &str, gone_at: Ts, step: usize, attempt: u32) -> RunFiles {
-        let base = format!("{id}-{}-step{}-attempt{attempt}", gone_at.0, step + 1);
+    pub fn run_files(&self, id: &str, trigger: u32, step: usize, attempt: u32) -> RunFiles {
+        let base = format!("{id}-t{trigger}-step{}-attempt{attempt}", step + 1);
         let dir = self.runs_dir();
         RunFiles {
             lock: dir.join(format!("{base}.lock")),
@@ -277,7 +276,7 @@ fn read_pid(file: &mut File) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::model::{Cmd, Entry, EntryState, StepConfig};
-    use crate::time::Dur;
+    use crate::time::{Dur, Ts};
 
     fn entry(name: &str) -> Entry {
         Entry {
@@ -291,6 +290,7 @@ mod tests {
                 after: Dur::ZERO,
             }],
             registered_at: Ts(0),
+            triggers: 0,
             state: EntryState::Watching,
         }
     }
@@ -371,8 +371,8 @@ mod tests {
     fn run_files_tell_running_from_exited_from_lost() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path()).unwrap();
-        let rf = store.run_files("abc", Ts(5), 0, 1);
-        assert!(rf.lock.ends_with("runs/abc-5-step1-attempt1.lock"));
+        let rf = store.run_files("abc", 5, 0, 1);
+        assert!(rf.lock.ends_with("runs/abc-t5-step1-attempt1.lock"));
         assert_eq!(rf.probe(), ClaimProbe::Lost, "never started");
         let lock = rf.acquire().unwrap();
         assert_eq!(rf.probe(), ClaimProbe::Running);

@@ -361,6 +361,7 @@ mod tests {
                         after: Dur::ZERO,
                     }],
                     registered_at: Ts(0),
+                    triggers: 0,
                     state: EntryState::Watching,
                 })
                 .collect(),

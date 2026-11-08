@@ -141,9 +141,11 @@ fn entry_from_v1(e: V1Entry) -> Entry {
             })
             .collect()
     };
+    let triggers = u32::from(!matches!(e.state, V1State::Watching));
     let state = match e.state {
         V1State::Watching => EntryState::Watching,
         V1State::Done { gone_at, at } | V1State::Failed { gone_at, at } => EntryState::Finished {
+            trigger: 1,
             gone_at,
             at,
             steps: records(e.steps.len()),
@@ -157,6 +159,7 @@ fn entry_from_v1(e: V1Entry) -> Entry {
                 .unwrap_or(e.steps.len());
             if i == e.steps.len() {
                 EntryState::Finished {
+                    trigger: 1,
                     gone_at,
                     at: gone_at,
                     steps: records(i),
@@ -182,6 +185,7 @@ fn entry_from_v1(e: V1Entry) -> Entry {
                     },
                 };
                 EntryState::Triggered {
+                    trigger: 1,
                     gone_at,
                     done: records(i),
                     current: Current {
@@ -201,6 +205,7 @@ fn entry_from_v1(e: V1Entry) -> Entry {
         env: e.env,
         steps,
         registered_at: e.registered_at,
+        triggers,
         state,
     }
 }

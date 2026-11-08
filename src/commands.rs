@@ -125,6 +125,7 @@ fn watch(store: &Store, args: WatchArgs, steps: Vec<StepSpec>) -> Result<i32> {
             })
             .collect(),
         registered_at: Ts::now(),
+        triggers: 0,
         state: EntryState::Watching,
     };
     let nsteps = entry.steps.len();
@@ -357,6 +358,7 @@ fn step_text(store: &Store, e: &Entry, i: usize, now: Ts) -> Option<String> {
         EntryState::Watching => None,
         EntryState::Finished { steps, .. } => steps.get(i).map(|r| record_text(r, now)),
         EntryState::Triggered {
+            trigger,
             gone_at,
             done,
             current,
@@ -389,7 +391,7 @@ fn step_text(store: &Store, e: &Entry, i: usize, now: Ts) -> Option<String> {
                     }
                 }
                 Phase::Running { claim } => {
-                    let files = store.run_files(&e.id, *gone_at, i, claim.attempt);
+                    let files = store.run_files(&e.id, *trigger, i, claim.attempt);
                     match files.probe() {
                         ClaimProbe::Running => format!(
                             "running for {} (attempt {}, {})",
@@ -468,8 +470,8 @@ fn run(store: &Store, target: &str, dry_run: bool) -> Result<i32> {
         };
         // A claim left by someone who is gone: record it first.
         if let Some((i, claim)) = e.claim_held() {
-            let gone_at = e.state.gone_at().unwrap_or(now);
-            let files = store.run_files(&id, gone_at, i, claim.attempt);
+            let trigger = e.state.trigger().unwrap_or(0);
+            let files = store.run_files(&id, trigger, i, claim.attempt);
             match files.probe() {
                 ClaimProbe::Running => bail!(
                     "step {} is being run by {}; try again when it is done",
@@ -490,11 +492,11 @@ fn run(store: &Store, target: &str, dry_run: bool) -> Result<i32> {
             }
         }
         // What claim_manual will produce, so the run lock can be taken first.
-        let (gone_at, step, attempt) = match e.current() {
-            Some((i, cur)) => (e.state.gone_at().unwrap_or(now), i, cur.failures + 1),
-            None => (now, 0, 1),
+        let (trigger, step, attempt) = match e.current() {
+            Some((i, cur)) => (e.state.trigger().unwrap_or(0), i, cur.failures + 1),
+            None => (e.triggers + 1, 0, 1),
         };
-        let files = store.run_files(&id, gone_at, step, attempt);
+        let files = store.run_files(&id, trigger, step, attempt);
         let lock = files.acquire()?;
         let owner2 = owner.clone();
         let (entry, claim) = store.update(|reg| {
@@ -504,7 +506,7 @@ fn run(store: &Store, target: &str, dry_run: bool) -> Result<i32> {
                 .find(|e| e.id == id)
                 .context("the registration was replaced or forgotten")?;
             let (i, claim) = e.claim_manual(owner2, now).map_err(anyhow::Error::msg)?;
-            if (e.state.gone_at(), i, claim.attempt) != (Some(gone_at), step, attempt) {
+            if (e.state.trigger(), i, claim.attempt) != (Some(trigger), step, attempt) {
                 bail!("the registration changed meanwhile; try again");
             }
             Ok((e.clone(), claim))

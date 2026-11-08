@@ -55,6 +55,10 @@ pub struct Entry {
     pub env: BTreeMap<String, String>,
     pub steps: Vec<StepConfig>,
     pub registered_at: Ts,
+    /// How many times this registration has triggered (by a delete or a
+    /// manual run).
+    #[serde(default)]
+    pub triggers: u32,
     #[serde(default)]
     pub state: EntryState,
 }
@@ -83,6 +87,11 @@ pub enum EntryState {
     #[default]
     Watching,
     Triggered {
+        /// Which trigger of this registration (1, 2, …): with the entry id,
+        /// names this run's files. Unique even when two triggers share a
+        /// millisecond.
+        #[serde(default)]
+        trigger: u32,
         gone_at: Ts,
         /// Steps `0..done.len()` have finished, in order.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -91,6 +100,8 @@ pub enum EntryState {
         current: Current,
     },
     Finished {
+        #[serde(default)]
+        trigger: u32,
         gone_at: Ts,
         at: Ts,
         steps: Vec<StepRecord>,
@@ -259,6 +270,16 @@ impl EntryState {
         }
     }
 
+    /// The trigger number, while triggered or finished.
+    pub fn trigger(&self) -> Option<u32> {
+        match *self {
+            EntryState::Watching => None,
+            EntryState::Triggered { trigger, .. } | EntryState::Finished { trigger, .. } => {
+                Some(trigger)
+            }
+        }
+    }
+
     pub fn gone_at(&self) -> Option<Ts> {
         match *self {
             EntryState::Watching => None,
@@ -307,14 +328,18 @@ impl Entry {
     /// A fresh trigger: step 0 waiting for its delay. An entry with no steps
     /// (never created by `gone watch`) finishes at once.
     fn start(&mut self, gone_at: Ts) {
+        self.triggers += 1;
+        let trigger = self.triggers;
         self.state = if self.steps.is_empty() {
             EntryState::Finished {
+                trigger,
                 gone_at,
                 at: gone_at,
                 steps: Vec::new(),
             }
         } else {
             EntryState::Triggered {
+                trigger,
                 gone_at,
                 done: Vec::new(),
                 current: self.waiting(0, gone_at),
@@ -441,6 +466,7 @@ impl Entry {
         let nsteps = self.steps.len();
         let next_after = self.steps.get(step + 1).map(|s| s.after);
         let EntryState::Triggered {
+            trigger,
             gone_at,
             done,
             current,
@@ -448,7 +474,7 @@ impl Entry {
         else {
             unreachable!("claim_held implies Triggered")
         };
-        let gone_at = *gone_at;
+        let (trigger, gone_at) = (*trigger, *gone_at);
         let attempt = claim.attempt;
         let (outcome, finished_step) = if result.ok {
             (Outcome::Ok, true)
@@ -479,6 +505,7 @@ impl Entry {
                 let steps = std::mem::take(done);
                 concluded = Some(steps.iter().all(StepRecord::ok));
                 self.state = EntryState::Finished {
+                    trigger,
                     gone_at,
                     at: now,
                     steps,
@@ -526,6 +553,7 @@ mod tests {
                 })
                 .collect(),
             registered_at: Ts(0),
+            triggers: 0,
             state: EntryState::Watching,
         }
     }
@@ -645,9 +673,26 @@ mod tests {
             .unwrap();
         assert_eq!((f.outcome, f.concluded), (Outcome::GaveUp, Some(false)));
         // A finished entry can be run again by hand: a fresh trigger.
-        let (i, _) = e.claim_manual(m, Ts(20)).unwrap();
+        let (i, _) = e.claim_manual(m.clone(), Ts(20)).unwrap();
         assert_eq!(i, 0);
         assert_eq!(e.state.gone_at(), Some(Ts(20)));
+        assert_eq!(e.state.trigger(), Some(2));
+    }
+
+    #[test]
+    fn triggers_in_the_same_millisecond_are_still_distinct() {
+        // Found by the state-machine property test: a manual re-run in the
+        // same millisecond reused the previous trigger's gone_at, which named
+        // the run files, so two runs shared lock, status and output files.
+        let m = Owner::Manual { pid: 9 };
+        let mut e = entry(&[0]);
+        let (_, c) = e.claim_manual(m.clone(), Ts(5)).unwrap();
+        e.finish(&c, result(false), &RetryPolicy::ONCE, Ts(5))
+            .unwrap();
+        let first = e.state.trigger();
+        e.claim_manual(m, Ts(5)).unwrap();
+        assert_eq!(e.state.gone_at(), Some(Ts(5)));
+        assert_ne!(e.state.trigger(), first);
     }
 
     #[test]
