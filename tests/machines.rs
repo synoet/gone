@@ -93,6 +93,11 @@ pub enum Action {
     ManualRun {
         slot: usize,
     },
+    /// A late or duplicated result for this slot's last finished attempt
+    /// arrives (a racing process): it must be ignored.
+    Duplicate {
+        slot: usize,
+    },
 }
 
 fn delays() -> impl Strategy<Value = u64> {
@@ -166,7 +171,13 @@ impl ReferenceStateMachine for Model {
                     .prop_map(|slot| Action::Forget { slot })
                     .boxed(),
             ),
-            (1, slot.prop_map(|slot| Action::ManualRun { slot }).boxed()),
+            (
+                1,
+                slot.clone()
+                    .prop_map(|slot| Action::ManualRun { slot })
+                    .boxed(),
+            ),
+            (1, slot.prop_map(|slot| Action::Duplicate { slot }).boxed()),
         ];
         // `gone watch` needs the directory to exist: only offer it then.
         let present: Vec<usize> = (0..SLOTS).filter(|&i| w.fs[i] == Fs::Present).collect();
@@ -250,6 +261,8 @@ pub struct Sut {
     probes: HashMap<String, Vec<(Ts, Probe)>>,
     /// Completed daemon passes.
     passes: u64,
+    /// The last recorded attempt per entry, to replay as a stale result.
+    last_finished: HashMap<String, (Claim, RunResult)>,
     /// What happened, for the coverage report (`GONE_PROPTEST_STATS=file`).
     stats: std::collections::BTreeMap<&'static str, u64>,
 }
@@ -509,6 +522,8 @@ impl Sut {
         let owner = owner.clone();
         let now = self.now;
         let r = result(how == Proc::Exited(true), now);
+        self.last_finished
+            .insert(id.clone(), (claim.clone(), r.clone()));
         if owner == self.core.me {
             let f = self.core.finish(&mut self.reg, &id, &claim, r, now);
             assert!(f.is_some(), "our own claim must be ours to finish");
@@ -629,6 +644,7 @@ impl StateMachineTest for Machine {
             probes: HashMap::new(),
             passes: 0,
             stats: Default::default(),
+            last_finished: HashMap::new(),
         };
         s.pass(w);
         s
@@ -665,6 +681,21 @@ impl StateMachineTest for Machine {
             Action::Watch { slot, afters } => s.watch(slot, &afters),
             Action::Forget { slot } => s.forget(slot),
             Action::ManualRun { slot } => s.manual_run(slot),
+            Action::Duplicate { slot } => {
+                if let Some(id) = s.slots[slot].clone()
+                    && let Some((claim, r)) = s.last_finished.get(&id).cloned()
+                {
+                    let before = s.reg.clone();
+                    let held = s.key_of(&id).map(|(_, c)| c);
+                    if held.as_ref() != Some(&claim) {
+                        let now = s.now;
+                        let f = s.core.finish(&mut s.reg, &id, &claim, r, now);
+                        assert_eq!(f, None, "a stale result was accepted");
+                        assert_eq!(s.reg, before, "a stale result changed the registry");
+                        s.count("stale_result_rejected");
+                    }
+                }
+            }
         }
         s.pass(w);
         s
@@ -710,6 +741,39 @@ impl StateMachineTest for Machine {
                 assert!(*deadline > s.now, "settling past its deadline");
             }
         }
+        // Refinement: the daemon's belief about each directory is exactly
+        // what its own check log implies.
+        for e in s
+            .reg
+            .entries
+            .iter()
+            .filter(|e| e.state == EntryState::Watching)
+        {
+            let log = s.probes.get(&e.id).map(Vec::as_slice).unwrap_or(&[]);
+            let expected = match log.last() {
+                None => None,
+                Some((_, Probe::Error(m))) if m == "<daemon restart>" => None,
+                Some((_, Probe::Present)) => Some(Presence::Present),
+                Some((_, Probe::Error(m))) => Some(Presence::Unknown { error: m.clone() }),
+                Some((_, Probe::Absent)) => {
+                    let start = log
+                        .iter()
+                        .rposition(|(_, p)| *p != Probe::Absent)
+                        .map_or(0, |i| i + 1);
+                    let since = log[start].0;
+                    Some(Presence::Settling {
+                        since,
+                        deadline: since.plus(Dur(SETTLE)),
+                    })
+                }
+            };
+            assert_eq!(
+                s.core.presence(&e.id),
+                expected.as_ref(),
+                "check log: {:?}",
+                &log[log.len().saturating_sub(4)..]
+            );
+        }
         // The sweep: a delete nobody was told about is still noticed within
         // one sweep interval, and acted on one settle later.
         for slot in 0..SLOTS {
@@ -725,6 +789,30 @@ impl StateMachineTest for Machine {
                     "dir gone since {since}, now {}, still not settling: {:?}",
                     s.now.0,
                     s.core.presence(&e.id)
+                );
+            }
+        }
+        // The daemon's view of its own runs, derived from the registry,
+        // matches the processes it actually started.
+        for (id, _, claim) in s.core.mine(&s.reg) {
+            let (key, _) = s.key_of(&id).unwrap();
+            let (owner, state) = &s.procs[&key];
+            assert_eq!(
+                owner, &s.core.me,
+                "the daemon claims a run it did not start: {claim:?}"
+            );
+            assert_eq!(*state, Proc::Running, "our run ended but is still claimed");
+        }
+        // No orphan whose process already ended is left unrecorded after a
+        // pass (only a live `gone run` may hold a claim on an ended process).
+        for (id, _, claim) in s.core.foreign(&s.reg) {
+            let (key, _) = s.key_of(&id).unwrap();
+            let live_manual = claim.owner == MANUAL && s.manual.as_ref().is_some_and(|m| m.1 == id);
+            if !live_manual {
+                assert_eq!(
+                    s.procs.get(&key).map(|p| p.1),
+                    Some(Proc::Running),
+                    "an orphaned attempt that ended was not recorded: {claim:?}"
                 );
             }
         }
