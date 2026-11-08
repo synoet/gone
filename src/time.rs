@@ -18,6 +18,11 @@ pub struct Ts(pub u64);
 pub struct Dur(pub u64);
 
 impl Ts {
+    /// 9999-12-31T23:59:59.999Z, the last instant the four-digit-year
+    /// format can hold. Times are clamped to it so the registry always reads
+    /// back, however large a delay is.
+    pub const MAX: Ts = Ts(253_402_300_799_999);
+
     pub fn now() -> Ts {
         let ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -27,7 +32,7 @@ impl Ts {
     }
 
     pub fn plus(self, d: Dur) -> Ts {
-        Ts(self.0.saturating_add(d.0))
+        Ts(self.0.saturating_add(d.0).min(Ts::MAX.0))
     }
 
     /// `self - earlier`, zero if `earlier` is later.
@@ -315,6 +320,18 @@ mod tests {
         );
         let now = Ts::now();
         assert_eq!(Ts::parse(&now.rfc3339()), Ok(now));
+    }
+
+    #[test]
+    fn far_future_times_clamp_and_still_round_trip() {
+        // Found by the state-machine property test: a huge --after made a due
+        // time in year 504474608, which serialized but never parsed back.
+        assert_eq!(Ts::MAX.rfc3339(), "9999-12-31T23:59:59.999Z");
+        assert_eq!(Ts::parse("9999-12-31T23:59:59.999Z"), Ok(Ts::MAX));
+        let far = Ts(1_000_000).plus(Dur(u64::MAX));
+        assert_eq!(far, Ts::MAX);
+        assert_eq!(Ts::parse(&far.rfc3339()), Ok(far));
+        assert_eq!(Ts::MAX.plus(Dur(1)), Ts::MAX);
     }
 
     #[test]
