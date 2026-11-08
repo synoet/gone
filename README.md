@@ -64,9 +64,9 @@ ExecStart=/home/you/.cargo/bin/gone daemon
 Environment=GONE_STATE_DIR=/home/you/.local/state/gone
 Restart=on-failure
 RestartSec=5s
-# SIGTERM goes to the daemon only; it waits for running steps (see
-# --shutdown-grace), then systemd kills what is left after TimeoutStopSec.
-KillMode=mixed
+# Steps outlive the daemon on purpose: on stop or crash they keep running,
+# and the next daemon records their exit status instead of re-running them.
+KillMode=process
 TimeoutStopSec=60s
 
 [Install]
@@ -75,7 +75,9 @@ WantedBy=default.target
 
 Without systemd, any way of keeping `gone daemon` running works (a tmux pane,
 a supervisor). Only one daemon runs per state directory; a second one exits
-with an error.
+with an error. On filesystems where inotify misses changes (NFS and other
+network mounts), run `gone daemon --no-inotify`: deletes are then noticed by
+the sweep alone (`--sweep-interval`, default 3m).
 
 ## Usage
 
@@ -148,14 +150,15 @@ daemon: running (pid 41237)
 feature-x  [triggered 2m ago]  /home/you/wt/feature-x
   1. now    sh -c 'docker compose -p "$GONE_NAME" down --remove-orphans'
      ok 2m ago (exit 0, took 3s)
-     output: /home/you/.local/state/gone/runs/1f0c…-step1-attempt1.log
+     output: /home/you/.local/state/gone/runs/1f0c…-t1-step1-attempt1.log
   2. +1d    docker volume prune --all --force --filter label=com.docker.compose.project=feature-x
      due in 23h57m
 ```
 
 States: `watching`, `triggered` (steps running or scheduled), `done` (every
 step succeeded), `FAILED` (every step finished and at least one gave up). A
-failed step shows its attempts and last error. `--json` prints the registry.
+running step shows who runs it (the daemon or a `gone run`); a failed one its
+attempts and last error. `--json` prints the registry.
 
 ### `gone run`
 
@@ -163,6 +166,12 @@ Runs a registration's steps now, in the foreground with output on your
 terminal, ignoring `--after` delays and retries. `--dry-run` prints the
 commands, cwd and full environment and runs nothing. Useful to check a
 teardown before you rely on it.
+
+A manual run is a trigger like a delete: on a watching or finished entry it
+starts a fresh one, on a triggered entry it continues from the current step
+(it refuses while the daemon is running that step). Ctrl-C stops the step,
+records it, and puts the registration back to `watching`, so the remaining
+steps are not left to the daemon.
 
 ### `gone log`
 
@@ -188,16 +197,60 @@ gone's own error messages, never a step's arguments, environment or output
   re-added when an ancestor is re-created.
 - A **sweep** re-checks every directory at startup and every few minutes
   (`--sweep-interval`, default 3m), so deletes while the daemon was down, or
-  missed events, are still caught.
-- A directory counts as gone only if looking it up fails with `ENOENT` (or
-  `ENOTDIR`, when an ancestor became a file). A permission error or any other
-  failure never triggers a teardown; it is logged as `check_error`.
-- After it is first seen gone, the daemon waits `--settle` (default 10s) and
-  checks again. If the directory is back (a worktree re-created at the same
-  path), the teardown is **cancelled** and the registration stays armed.
-- A registration triggers at most once: the transition happens under the
-  registry lock and only from `watching`. Each step is claimed by one owner
-  (the daemon, or a manual `gone run`) before it runs.
+  missed or overflowed events, are still caught.
+- A check says **gone** only if looking the path up fails with `ENOENT` (or
+  `ENOTDIR`, when an ancestor became a file). Any other failure (EACCES, EIO,
+  …) is an **error**: logged as `check_error`, and it never triggers.
+
+Per directory the daemon keeps one belief, in memory:
+
+```text
+            absent                        absent, settle delay over
+ present ─────────▶ settling{since} ───────────────────────────▶ teardown (gone_at = since)
+    ▲   ◀─present── │       │
+    │  (cancelled)  │       └──error──▶ unknown{error}
+    └────present────┴──────────────────── │ ──absent──▶ settling{since: now}
+```
+
+The rule: **a teardown starts only after the directory was seen absent on
+every check for a full settle delay (`--settle`, default 10s), with no check
+in between that saw it present or failed.** If it comes back (a worktree
+re-created at the same path), the teardown is cancelled and the
+registration stays armed. An error during settling interrupts it and the
+next absent check starts the settle over, so an error can delay a teardown
+by one settle delay but never cause one, and nothing waits forever. A daemon
+restart forgets settling the same way (it starts over).
+
+## Steps, claims and crashes
+
+Once triggered, a registration's run state lives in the registry:
+
+```text
+ watching ──trigger──▶ triggered{done, current} ──last step finishes──▶ finished (done | FAILED)
+    ▲                       current: waiting{due_at} ⇄ running{claim}
+    └──────── gone watch (a new registration) ◀─────────────────────────────┘
+```
+
+Steps run in order; `current` is the one unfinished step, waiting for its
+due time (its `--after`, or a retry backoff) or **claimed** by exactly one
+owner: the daemon (pid + a per-start instance id) or a `gone run`. A
+registration triggers at most once; only a new `gone watch` re-arms it.
+
+Each attempt runs under a small supervisor (`gone __supervise`) that holds
+the attempt's run lock for as long as the step runs and writes its exit
+status when it ends. So whether an attempt is running is never guessed from
+a pid:
+
+- **The daemon stops or crashes mid-step:** the step keeps running (the
+  unit uses `KillMode=process`). The next daemon finds the claim, sees the
+  lock held, waits, and records the step's real exit status. Nothing runs
+  twice.
+- **The step's process dies too, without an exit status** (a reboot, an OOM
+  kill of the group): the next daemon finds the lock free and no status, and
+  records an **interrupted** attempt, retried like any failure. This is the
+  only case where a step can run again after it may already have done its
+  work, so teardown commands should still be safe to run twice
+  (`docker compose down` is).
 
 ## Failures and retries
 
@@ -207,23 +260,22 @@ doubling up to `--retry-max` (30m), for `--max-attempts` (6) attempts in
 total. Then it is marked failed and the next step runs. Failures and retries
 show in `gone list` and `gone log`.
 
-If the daemon dies while a step is running, the next daemon finds the step
-still claimed by a dead process and counts it as an interrupted attempt,
-retried like any other failure. Teardown commands should therefore be safe
-to run twice (`docker compose down` is).
-
 ## State
 
 Everything lives in `$GONE_STATE_DIR`, else `$XDG_STATE_HOME/gone`, else
 `~/.local/state/gone` (all private, mode 0700/0600):
 
 - `registry.json`: the registrations, pretty-printed JSON with readable
-  timestamps (`2026-11-08T18:56:36.000Z`) and durations (`1d`). Every write
+  timestamps (`2026-11-08T18:56:36.000Z`) and durations (`1d`), and a
+  `version` (now 2; version 1 files from gone 0.1 are read and converted on
+  the next write). Every write
   takes an exclusive lock and replaces the file atomically (write a temp
   file, fsync, rename), so concurrent `gone watch` calls and the daemon never
   lose each other's changes and a reader never sees half a file.
 - `events.jsonl`: the action log.
-- `runs/`: per-attempt output of daemon-run steps (pruned after 30 days).
+- `runs/`: per attempt, `<id>-t<trigger>-step<N>-attempt<M>.log` (output of
+  daemon-run steps, pruned after 30 days) and, while it runs, `.lock` and
+  `.status`.
 - `daemon.lock`: held by the running daemon.
 
 ## Development
@@ -232,5 +284,13 @@ Everything lives in `$GONE_STATE_DIR`, else `$XDG_STATE_HOME/gone`, else
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
-The integration tests (`tests/daemon.rs`) drive the real binary and a real
-daemon against temp directories with short timings. See `AGENTS.md`.
+- `tests/daemon.rs`: the real binary and a real daemon against temp
+  directories with short timings.
+- `tests/machines.rs`: proptest-state-machine over the pure daemon core and
+  registry model (a simulated world: checks, lost events, step processes,
+  restarts, replace, forget, manual runs).
+- `tests/paths.rs`: path shapes (trailing slash, `.`/`..`, symlinks, unicode,
+  non-UTF-8, nested dirs).
+
+`PROPTEST_CASES=10000 cargo test --release --test machines` for a deep run
+(the default is 256 cases). See `AGENTS.md`.
