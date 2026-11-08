@@ -61,6 +61,14 @@ fn watch(store: &Store, args: WatchArgs, steps: Vec<StepSpec>) -> Result<i32> {
     if !dir.is_dir() {
         bail!("{} is not a directory", dir.display());
     }
+    // Found by the path property test: a non-UTF-8 name used to fail deep in
+    // serialization with "path contains invalid UTF-8 characters".
+    if dir.to_str().is_none() {
+        bail!(
+            "cannot watch {}: the path is not valid UTF-8, and the registry stores paths as text",
+            dir.display()
+        );
+    }
     if dir.parent().is_none() {
         bail!("refusing to watch /");
     }
@@ -69,6 +77,9 @@ fn watch(store: &Store, args: WatchArgs, steps: Vec<StepSpec>) -> Result<i32> {
         Some(c) => std::fs::canonicalize(&c).with_context(|| format!("--cwd {}", c.display()))?,
         None => bail!("HOME is not set; pass --cwd"),
     };
+    if cwd.to_str().is_none() {
+        bail!("--cwd {}: the path is not valid UTF-8", cwd.display());
+    }
     if cwd.starts_with(&dir) {
         bail!(
             "--cwd {} is inside the watched directory; steps run after it is deleted, \

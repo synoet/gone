@@ -833,3 +833,23 @@ prop_state_machine! {
     #[test]
     fn daemon_core_state_machine(sequential 1..60 => Machine);
 }
+
+proptest! {
+    #![proptest_config(Config {
+        cases: std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(256),
+        failure_persistence: None,
+        .. Config::default()
+    })]
+
+    /// Every time the model can produce, and every duration, survives its
+    /// text form in the registry.
+    #[test]
+    fn times_and_durations_round_trip(base in 0u64..=Ts::MAX.0, add in any::<u64>(), d in any::<u64>()) {
+        let t = Ts(base).plus(Dur(add));
+        prop_assert!(t <= Ts::MAX);
+        prop_assert_eq!(Ts::parse(&t.rfc3339()), Ok(t));
+        prop_assert_eq!(Dur::parse(&Dur(d).to_string()), Ok(Dur(d)));
+        let json = serde_json::to_string(&(t, Dur(d))).unwrap();
+        prop_assert_eq!(serde_json::from_str::<(Ts, Dur)>(&json).unwrap(), (t, Dur(d)));
+    }
+}
