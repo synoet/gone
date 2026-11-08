@@ -583,7 +583,6 @@ pub fn unit_text(exe: &Path, state_dir: &Path) -> String {
         "\
 [Unit]
 Description=gone: run teardown commands when watched directories are deleted
-Documentation=file://{exe_dir}
 
 [Service]
 Type=simple
@@ -600,7 +599,6 @@ TimeoutStopSec=60s
 WantedBy=default.target
 ",
         exe = systemd_escape(&exe.display().to_string()),
-        exe_dir = exe.parent().unwrap_or(Path::new("/")).display(),
         state = systemd_escape(&state_dir.display().to_string()),
     )
 }
