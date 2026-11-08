@@ -1,8 +1,10 @@
 # AGENTS.md
 
 Notes for agents (and people) changing `gone`. Read `README.md` first for
-what it does and why; its "How it decides a directory is gone" and "Steps,
-claims and crashes" sections describe the state machines below.
+what it does and why, and `skills/gone/SKILL.md` for its full behavior; that
+skill's "When it decides a directory is gone" and "Failures and crashes"
+sections describe the state machines below. Keep the skill in step with any
+change to flags, states or crash handling.
 
 ## Layout
 
