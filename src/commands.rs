@@ -1,10 +1,16 @@
 //! What each subcommand does.
 
 use crate::cli::{Cli, Command, DaemonArgs, ServiceCommand, StepSpec, WatchArgs};
+use crate::core::{self, ClaimProbe};
 use crate::daemon::{self, short, step_env};
 use crate::events::{Logger, format_line, v};
+use crate::exec::Supervised;
 use crate::exec::{self, Job, Output};
-use crate::model::{Entry, EntryState, Outcome, Registry, RetryPolicy, Step, StepStatus};
+use crate::model::{
+    Entry, EntryState, Outcome, Owner, Phase, Registry, RetryPolicy, RunResult, StepConfig,
+    StepRecord,
+};
+use crate::presence::Probe;
 use crate::store::Store;
 use crate::time::{Ts, approx};
 use anyhow::{Context, Result, bail};
@@ -12,10 +18,20 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 pub fn main(cli: Cli, steps: Vec<StepSpec>) -> Result<i32> {
+    if let Command::Supervise {
+        status,
+        lock_fd,
+        argv,
+    } = &cli.command
+    {
+        return Ok(exec::supervise(status, *lock_fd, argv));
+    }
     let root = match &cli.state_dir {
         Some(d) => d.clone(),
         None => Store::default_root()?,
@@ -31,6 +47,7 @@ pub fn main(cli: Cli, steps: Vec<StepSpec>) -> Result<i32> {
         Command::Service {
             command: ServiceCommand::Print,
         } => service_print(&store),
+        Command::Supervise { .. } => unreachable!("handled above"),
     }
 }
 
@@ -102,12 +119,9 @@ fn watch(store: &Store, args: WatchArgs, steps: Vec<StepSpec>) -> Result<i32> {
         env,
         steps: steps
             .into_iter()
-            .map(|s| Step {
+            .map(|s| StepConfig {
                 cmd: s.cmd,
                 after: s.after,
-                status: StepStatus::Pending,
-                attempts: 0,
-                last: None,
             })
             .collect(),
         registered_at: Ts::now(),
@@ -282,7 +296,7 @@ fn list(store: &Store, json: bool) -> Result<i32> {
                 format!("+{}", s.after)
             };
             writeln!(out, "  {}. {when:<6} {}", i + 1, s.cmd.display())?;
-            if let Some(status) = step_text(e, i, now) {
+            if let Some(status) = step_text(store, e, i, now) {
                 writeln!(out, "     {status}")?;
             }
         }
@@ -291,66 +305,109 @@ fn list(store: &Store, json: bool) -> Result<i32> {
 }
 
 fn state_text(e: &Entry, now: Ts) -> String {
-    match e.state {
-        EntryState::Watching => match daemon::presence(&e.dir) {
-            Ok(daemon::Presence::Absent) => "watching, dir is gone: the daemon will act".into(),
-            Ok(daemon::Presence::Present) => "watching".into(),
-            Err(err) => format!("watching, cannot check dir: {err}"),
+    match &e.state {
+        EntryState::Watching => match daemon::probe_dir(&e.dir) {
+            Probe::Absent => "watching, dir is gone: the daemon will act".into(),
+            Probe::Present => "watching".into(),
+            Probe::Error(err) => format!("watching, cannot check dir: {err}"),
         },
-        EntryState::Triggered { gone_at } => {
-            format!("triggered {} ago", approx(now.since(gone_at)))
+        EntryState::Triggered { gone_at, .. } => {
+            format!("triggered {} ago", approx(now.since(*gone_at)))
         }
-        EntryState::Done { at, .. } => format!("done {} ago", approx(now.since(at))),
-        EntryState::Failed { at, .. } => format!("FAILED {} ago", approx(now.since(at))),
+        EntryState::Finished { at, .. } => {
+            let kind = if e.state.kind() == "done" {
+                "done"
+            } else {
+                "FAILED"
+            };
+            format!("{kind} {} ago", approx(now.since(*at)))
+        }
     }
 }
 
-fn step_text(e: &Entry, i: usize, now: Ts) -> Option<String> {
-    let s = &e.steps[i];
-    let last = s.last.as_ref().map(|r| {
-        let what = match (&r.error, r.exit_code) {
-            (Some(err), _) => err.clone(),
-            (None, Some(c)) => format!("exit {c}"),
-            (None, None) => "ok".into(),
-        };
-        format!("{what}, took {}", approx(r.took))
-    });
-    let text = match &s.status {
-        StepStatus::Pending => match (&e.state, e.due_at(i)) {
-            (EntryState::Watching, _) => return last.map(|l| format!("last run: {l}")),
-            (_, Some(due)) if due > now => format!("due in {}", approx(due.since(now))),
-            _ => "due now".into(),
-        },
-        StepStatus::Running { pid, since } => {
-            format!("running for {} (pid {pid})", approx(now.since(*since)))
-        }
-        StepStatus::Retry { next_at } => format!(
-            "attempt {} failed: {}; retry in {}",
-            s.attempts,
-            last.unwrap_or_default(),
-            approx(next_at.since(now))
-        ),
-        StepStatus::Ok { at } => format!(
-            "ok {} ago ({})",
-            approx(now.since(*at)),
-            last.unwrap_or_default()
-        ),
-        StepStatus::Failed { at } => format!(
-            "FAILED after {} attempt{} {} ago: {}",
-            s.attempts,
-            plural(s.attempts as usize),
-            approx(now.since(*at)),
-            last.unwrap_or_default()
-        ),
+fn result_text(r: &RunResult) -> String {
+    let what = match (&r.error, r.exit_code) {
+        (Some(err), _) => err.clone(),
+        (None, Some(c)) => format!("exit {c}"),
+        (None, None) => "ok".into(),
     };
-    let output = s
-        .last
-        .as_ref()
-        .and_then(|r| r.output.as_ref())
-        .filter(|_| !matches!(s.status, StepStatus::Pending | StepStatus::Running { .. }))
-        .map(|p| format!("\n     output: {}", p.display()))
-        .unwrap_or_default();
-    Some(text + &output)
+    format!("{what}, took {}", approx(r.took))
+}
+
+fn record_text(r: &StepRecord, now: Ts) -> String {
+    let ago = approx(now.since(r.result.at.plus(r.result.took)));
+    let mut s = if r.ok() {
+        format!("ok {ago} ago ({})", result_text(&r.result))
+    } else {
+        format!(
+            "FAILED after {} attempt{} {ago} ago: {}",
+            r.attempts,
+            plural(r.attempts as usize),
+            result_text(&r.result)
+        )
+    };
+    if let Some(p) = &r.result.output {
+        s.push_str(&format!("\n     output: {}", p.display()));
+    }
+    s
+}
+
+fn step_text(store: &Store, e: &Entry, i: usize, now: Ts) -> Option<String> {
+    match &e.state {
+        EntryState::Watching => None,
+        EntryState::Finished { steps, .. } => steps.get(i).map(|r| record_text(r, now)),
+        EntryState::Triggered {
+            gone_at,
+            done,
+            current,
+        } => {
+            if let Some(r) = done.get(i) {
+                return Some(record_text(r, now));
+            }
+            if i > done.len() {
+                let due = gone_at.plus(e.steps[i].after);
+                return Some(if due > now {
+                    format!("pending, due in {} at the earliest", approx(due.since(now)))
+                } else {
+                    format!("pending, after step {}", done.len() + 1)
+                });
+            }
+            Some(match &current.phase {
+                Phase::Waiting { due_at } => {
+                    let when = if *due_at > now {
+                        format!("in {}", approx(due_at.since(now)))
+                    } else {
+                        "now".into()
+                    };
+                    match &current.last {
+                        Some(last) if current.failures > 0 => format!(
+                            "attempt {} failed: {}; retry {when}",
+                            current.failures,
+                            result_text(last)
+                        ),
+                        _ => format!("due {when}"),
+                    }
+                }
+                Phase::Running { claim } => {
+                    let files = store.run_files(&e.id, *gone_at, i, claim.attempt);
+                    match files.probe() {
+                        ClaimProbe::Running => format!(
+                            "running for {} (attempt {}, {})",
+                            approx(now.since(claim.since)),
+                            claim.attempt,
+                            claim.owner.describe()
+                        ),
+                        _ => format!(
+                            "attempt {} ended while its owner ({}) was away; \
+                             the daemon will record it",
+                            claim.attempt,
+                            claim.owner.describe()
+                        ),
+                    }
+                }
+            })
+        }
+    }
 }
 
 fn run(store: &Store, target: &str, dry_run: bool) -> Result<i32> {
@@ -383,103 +440,152 @@ fn run(store: &Store, target: &str, dry_run: bool) -> Result<i32> {
         return Ok(0);
     }
 
-    let pid = std::process::id();
+    // Ctrl-C reaches the step (it shares our process group); we stay alive
+    // to record what happened and stop.
+    let interrupted = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGINT, interrupted.clone())?;
+    let exe = std::env::current_exe().context("finding the gone binary")?;
+    let owner = Owner::Manual {
+        pid: std::process::id(),
+    };
     let id = entry.id.clone();
-    let now = Ts::now();
-    let (entry, claimed) = store.update(|reg| {
-        let e = reg
-            .entries
-            .iter_mut()
-            .find(|e| e.id == id)
-            .context("the registration changed meanwhile; try again")?;
-        let claimed = e
-            .claim_all(pid, now, exec::pid_alive)
-            .map_err(anyhow::Error::msg)?;
-        Ok((e.clone(), claimed))
-    })?;
     let log = logger(store);
-    let base = [
-        ("name", v(entry.name.clone())),
-        ("dir", v(entry.dir.display().to_string())),
-        ("id", v(short(&entry.id))),
-    ];
-    log.event(
-        "manual_run",
-        &[
-            base[0].clone(),
-            base[1].clone(),
-            base[2].clone(),
-            ("steps", v(claimed.len())),
-        ],
-    );
-    if claimed.is_empty() {
-        println!("nothing to run: every step already succeeded");
-        return Ok(0);
-    }
-    let env = step_env(&entry);
+    let base = |e: &Entry| {
+        vec![
+            ("name", v(e.name.clone())),
+            ("dir", v(e.dir.display().to_string())),
+            ("id", v(short(&e.id))),
+        ]
+    };
+    log.event("manual_run", &base(&entry));
     let mut failed = 0;
-    for i in claimed {
-        let step = &entry.steps[i];
+    loop {
+        let now = Ts::now();
+        let reg = store.load()?;
+        let Some(e) = reg.entries.iter().find(|e| e.id == id) else {
+            eprintln!("gone: the registration was replaced or forgotten; stopping");
+            return Ok(1);
+        };
+        // A claim left by someone who is gone: record it first.
+        if let Some((i, claim)) = e.claim_held() {
+            let gone_at = e.state.gone_at().unwrap_or(now);
+            let files = store.run_files(&id, gone_at, i, claim.attempt);
+            match files.probe() {
+                ClaimProbe::Running => bail!(
+                    "step {} is being run by {}; try again when it is done",
+                    i + 1,
+                    claim.owner.describe()
+                ),
+                probe => {
+                    let claim = claim.clone();
+                    store.update(|reg| {
+                        if let Some(e) = reg.entries.iter_mut().find(|e| e.id == id) {
+                            core::resolve(e, &claim, probe, &RetryPolicy::ONCE, now);
+                        }
+                        Ok(())
+                    })?;
+                    files.cleanup();
+                    continue;
+                }
+            }
+        }
+        // What claim_manual will produce, so the run lock can be taken first.
+        let (gone_at, step, attempt) = match e.current() {
+            Some((i, cur)) => (e.state.gone_at().unwrap_or(now), i, cur.failures + 1),
+            None => (now, 0, 1),
+        };
+        let files = store.run_files(&id, gone_at, step, attempt);
+        let lock = files.acquire()?;
+        let owner2 = owner.clone();
+        let (entry, claim) = store.update(|reg| {
+            let e = reg
+                .entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .context("the registration was replaced or forgotten")?;
+            let (i, claim) = e.claim_manual(owner2, now).map_err(anyhow::Error::msg)?;
+            if (e.state.gone_at(), i, claim.attempt) != (Some(gone_at), step, attempt) {
+                bail!("the registration changed meanwhile; try again");
+            }
+            Ok((e.clone(), claim))
+        })?;
+        let cmd = &entry.steps[step].cmd;
         eprintln!(
             "gone: step {}/{}: {}",
-            i + 1,
+            step + 1,
             entry.steps.len(),
-            step.cmd.display()
+            cmd.display()
         );
-        let job = Job {
-            cmd: &step.cmd,
+        let env = step_env(&entry);
+        let result = exec::run(&Job {
+            cmd,
             cwd: &entry.cwd,
             env: &env,
             timeout: None,
             output: Output::Inherit,
-        };
-        let result = exec::run(&job, |_| {});
-        let summary = match &result.error {
-            Some(e) => e.clone(),
-            None => "ok".into(),
-        };
-        eprintln!("gone: step {}: {summary} ({})", i + 1, approx(result.took));
-        let mut fields = base.to_vec();
+            own_group: false,
+            supervised: Some(Supervised {
+                exe: &exe,
+                files: &files,
+                lock: &lock,
+            }),
+        });
+        let summary = result.error.clone().unwrap_or_else(|| "ok".into());
+        eprintln!(
+            "gone: step {}: {summary} ({})",
+            step + 1,
+            approx(result.took)
+        );
+        let mut fields = base(&entry);
         fields.extend([
-            ("step", v(i + 1)),
-            ("program", v(step.cmd.program())),
+            ("step", v(step + 1)),
+            ("program", v(cmd.program())),
             ("exit", result.exit_code.map(v).unwrap_or(Value::Null)),
             ("took", v(approx(result.took))),
             ("error", result.error.clone().map(v).unwrap_or(Value::Null)),
             ("manual", v(true)),
         ]);
+        let stop = interrupted.load(Ordering::Relaxed);
         let done = Ts::now();
         let f = store.update(|reg| {
-            Ok(reg
-                .entries
-                .iter_mut()
-                .find(|e| e.id == id)
-                .and_then(|e| e.finish(i, pid, result, &RetryPolicy::ONCE, done)))
+            let Some(e) = reg.entries.iter_mut().find(|e| e.id == id) else {
+                return Ok(None);
+            };
+            let f = e.finish(&claim, result, &RetryPolicy::ONCE, done);
+            if stop && f.is_some() {
+                // Don't leave the rest of an interrupted manual run to the
+                // daemon: re-arm, so only a real delete runs it.
+                e.state = EntryState::Watching;
+            }
+            Ok(f)
         })?;
-        match f {
-            Some(f) => {
-                if f.outcome != Outcome::Ok {
-                    failed += 1;
-                }
-                log.event(
-                    if f.outcome == Outcome::Ok {
-                        "step_ok"
-                    } else {
-                        "step_failed"
-                    },
-                    &fields,
-                );
-                if let Some(state) = f.concluded {
-                    log.event(state.kind(), &base);
-                }
-            }
-            None => {
-                eprintln!("gone: the registration was replaced or forgotten meanwhile; stopping");
-                return Ok(1);
-            }
+        files.cleanup();
+        drop(lock);
+        let Some(f) = f else {
+            eprintln!("gone: the registration was replaced or forgotten meanwhile; stopping");
+            return Ok(1);
+        };
+        if f.outcome != Outcome::Ok {
+            failed += 1;
+        }
+        log.event(
+            if f.outcome == Outcome::Ok {
+                "step_ok"
+            } else {
+                "step_failed"
+            },
+            &fields,
+        );
+        if stop {
+            log.event("manual_run_interrupted", &base(&entry));
+            eprintln!("gone: interrupted; the registration is watching again");
+            return Ok(130);
+        }
+        if let Some(all_ok) = f.concluded {
+            log.event(if all_ok { "done" } else { "failed" }, &base(&entry));
+            return Ok(if failed > 0 { 1 } else { 0 });
         }
     }
-    Ok(if failed > 0 { 1 } else { 0 })
 }
 
 fn forget(store: &Store, target: &str) -> Result<i32> {
@@ -560,6 +666,7 @@ fn run_daemon(store: &Store, a: &DaemonArgs) -> Result<i32> {
         },
         step_timeout: (!a.step_timeout.is_zero()).then(|| a.step_timeout.std()),
         shutdown_grace: a.shutdown_grace.std(),
+        inotify: !a.no_inotify,
     };
     daemon::run(store, &cfg)?;
     Ok(0)
@@ -590,9 +697,9 @@ ExecStart={exe} daemon
 Environment=GONE_STATE_DIR={state}
 Restart=on-failure
 RestartSec=5s
-# SIGTERM goes to the daemon only; it waits for running steps (see
-# --shutdown-grace), then systemd kills what is left after TimeoutStopSec.
-KillMode=mixed
+# Steps outlive the daemon on purpose: on stop or crash they keep running,
+# and the next daemon records their exit status instead of re-running them.
+KillMode=process
 TimeoutStopSec=60s
 
 [Install]

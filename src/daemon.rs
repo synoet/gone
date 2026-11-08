@@ -1,38 +1,36 @@
-//! The background service.
+//! The background service: the IO shell around [`crate::core::Core`].
 //!
-//! One loop, woken by inotify events, step completions, or a short tick:
+//! Each pass: reload the registry if it changed; keep inotify watches on
+//! every ancestor of every watched directory (a cache, rebuilt from the
+//! registry); check the directories `Core` asks for and feed the results
+//! back; settle claims left by an earlier daemon or a `gone run`; claim and
+//! start due steps. A pass runs when an event or a step result arrives, when
+//! a settle deadline or due time comes, and at least every tick.
 //!
-//! 1. reload the registry if the file changed (no restart needed);
-//! 2. keep an inotify watch on every ancestor of every watched directory,
-//!    re-adding watches when an ancestor is re-created;
-//! 3. check watched directories that an event touched, that are new, or (on
-//!    every sweep) all of them; a directory that is really absent (ENOENT /
-//!    ENOTDIR, never a permission error) starts settling;
-//! 4. after the settle delay, re-check: back → cancelled, still gone →
-//!    triggered (persisted, with the time it was first seen gone);
-//! 5. claim and run due steps, one at a time per entry, in worker threads;
-//! 6. record results, scheduling retries with backoff.
-//!
-//! Everything that must survive a restart (triggered entries, delayed steps,
-//! retries) lives in the registry; only settling is in memory, and a restart
-//! simply sees the directory missing again and settles afresh.
+//! Each attempt runs under `gone __supervise` in its own process group,
+//! holding the attempt's run lock (see `exec`). The daemon never kills
+//! running steps when it stops: they finish on their own and the next daemon
+//! records their exit status.
 
+use crate::core::{ClaimProbe, Core, Lifecycle, Note};
 use crate::events::{Logger, v};
-use crate::exec::{self, Job, Output};
-use crate::model::{Entry, EntryState, Outcome, RetryPolicy, RunResult};
-use crate::store::Store;
+use crate::exec::{self, Job, Output, Supervised};
+use crate::model::{Claim, Entry, Outcome, Owner, Registry, RetryPolicy, RunResult};
+use crate::presence::{Notice, Probe};
+use crate::store::{RunFiles, Store};
 use crate::time::{Dur, Ts, approx};
 use anyhow::{Context, Result};
 use notify::event::{EventKind, ModifyKind};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -45,75 +43,72 @@ pub struct Config {
     pub retry: RetryPolicy,
     /// A step running longer than this is killed and counts as failed.
     pub step_timeout: Option<Duration>,
-    /// On SIGTERM/SIGINT, how long to wait for running steps before killing them.
+    /// On SIGTERM/SIGINT, how long to wait for our running steps to finish
+    /// (so we record their results) before exiting and leaving them running.
     pub shutdown_grace: Duration,
+    /// Off: notice deletes by sweeping only.
+    pub inotify: bool,
 }
 
 enum Msg {
     Fs(notify::Result<notify::Event>),
     Done {
         id: String,
-        step: usize,
+        claim: Claim,
         result: RunResult,
+        files: RunFiles,
+        lock: File,
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Presence {
-    Present,
-    Absent,
-}
-
-/// Absent only on ENOENT/ENOTDIR. Anything else (EACCES, EIO, …) is an
-/// error, and an error never triggers a teardown.
-pub fn presence(path: &Path) -> std::io::Result<Presence> {
+/// One check of a watched directory. Absent only on ENOENT/ENOTDIR;
+/// anything else (EACCES, EIO, …) is an error, which never triggers.
+pub fn probe_dir(path: &Path) -> Probe {
     match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(Presence::Present),
+        Ok(_) => Probe::Present,
         Err(e)
             if e.kind() == std::io::ErrorKind::NotFound
                 || e.kind() == std::io::ErrorKind::NotADirectory =>
         {
-            Ok(Presence::Absent)
+            Probe::Absent
         }
-        Err(e) => Err(e),
+        Err(e) => Probe::Error(e.to_string()),
     }
-}
-
-struct Settling {
-    since: Ts,
-    deadline: Ts,
 }
 
 struct Daemon<'a> {
     store: &'a Store,
     cfg: &'a Config,
     log: Logger,
-    pid: u32,
+    exe: PathBuf,
     tx: Sender<Msg>,
     watcher: RecommendedWatcher,
-    reg: Vec<Entry>,
+    core: Core,
+    reg: Registry,
     reg_sig: Option<(u64, u64, SystemTime)>,
     reg_error: Option<String>,
-    /// Watched path → (dev, ino) of the directory the watch is on.
+    /// Cache: watched path → (dev, ino) of the directory the watch is on.
     watched: HashMap<PathBuf, (u64, u64)>,
     watch_errors: HashSet<PathBuf>,
-    check_errors: HashMap<String, String>,
-    known: HashSet<String>,
-    settling: HashMap<String, Settling>,
-    /// Entry id → (step, child pid once spawned).
-    running: HashMap<String, usize>,
-    children: Arc<Mutex<HashMap<String, u32>>>,
+    /// Log dedupe only: foreign claims we already said we are waiting on.
+    adopted_logged: HashSet<(String, u32)>,
     touched: Vec<PathBuf>,
-    force_sweep: bool,
-    last_sweep: Instant,
-    first_pass: bool,
+}
+
+pub fn new_instance() -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 4];
+    let _ = File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf));
+    let mix = u32::from_le_bytes(buf) ^ (Ts::now().0 as u32) ^ std::process::id().rotate_left(16);
+    format!("{mix:08x}")
 }
 
 pub fn run(store: &Store, cfg: &Config) -> Result<()> {
-    let _lock = store.lock_daemon()?;
+    let instance = new_instance();
+    let _lock = store.lock_daemon(&instance)?;
     let term = Arc::new(AtomicBool::new(false));
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
-        // A second signal while shutting down exits at once.
+        // A second signal while draining exits at once.
         signal_hook::flag::register_conditional_shutdown(sig, 1, term.clone())?;
         signal_hook::flag::register(sig, term.clone())?;
     }
@@ -123,33 +118,37 @@ pub fn run(store: &Store, cfg: &Config) -> Result<()> {
         let _ = fs_tx.send(Msg::Fs(res));
     })
     .context("starting inotify")?;
-
+    let exe = std::env::current_exe().context("finding the gone binary")?;
+    let me = Owner::Daemon {
+        pid: std::process::id(),
+        instance: instance.clone(),
+    };
     let mut d = Daemon {
         store,
         cfg,
         log: Logger::new(store.events_path(), true),
-        pid: std::process::id(),
+        exe,
         tx,
         watcher,
-        reg: Vec::new(),
+        core: Core::new(
+            me,
+            Dur::from_std(cfg.settle),
+            Dur::from_std(cfg.sweep_interval),
+            cfg.retry,
+        ),
+        reg: Registry::default(),
         reg_sig: None,
         reg_error: None,
         watched: HashMap::new(),
         watch_errors: HashSet::new(),
-        check_errors: HashMap::new(),
-        known: HashSet::new(),
-        settling: HashMap::new(),
-        running: HashMap::new(),
-        children: Arc::default(),
+        adopted_logged: HashSet::new(),
         touched: Vec::new(),
-        force_sweep: false,
-        last_sweep: Instant::now(),
-        first_pass: true,
     };
     d.log.event(
         "daemon_start",
         &[
-            ("pid", v(d.pid)),
+            ("pid", v(std::process::id())),
+            ("instance", v(instance)),
             ("state_dir", v(store.root().display().to_string())),
             ("settle", v(Dur::from_std(cfg.settle).to_string())),
             ("sweep", v(Dur::from_std(cfg.sweep_interval).to_string())),
@@ -166,7 +165,6 @@ pub fn run(store: &Store, cfg: &Config) -> Result<()> {
         );
     }
 
-    let mut stop_deadline: Option<Instant> = None;
     loop {
         let mut msgs = Vec::new();
         match rx.recv_timeout(d.sleep_for()) {
@@ -178,24 +176,21 @@ pub fn run(store: &Store, cfg: &Config) -> Result<()> {
         for m in msgs {
             d.handle(m);
         }
-        let stopping = term.load(Ordering::Relaxed);
-        if stopping && stop_deadline.is_none() {
-            d.log
-                .event("daemon_stopping", &[("running", v(d.running.len()))]);
-            stop_deadline = Some(Instant::now() + cfg.shutdown_grace);
+        if term.load(Ordering::Relaxed) && !matches!(d.core.lifecycle, Lifecycle::Draining { .. }) {
+            let mine = d.core.mine(&d.reg).len();
+            d.log.event("daemon_stopping", &[("running", v(mine))]);
+            d.core.drain(Ts::now(), Dur::from_std(cfg.shutdown_grace));
         }
-        d.pass(!stopping);
-        if let Some(deadline) = stop_deadline {
-            if d.running.is_empty() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                d.kill_running();
-                break;
-            }
+        d.pass();
+        if d.core.should_exit(&d.reg, Ts::now()) {
+            break;
         }
     }
-    d.log.event("daemon_stop", &[("pid", v(d.pid))]);
+    let left = d.core.mine(&d.reg).len();
+    d.log.event(
+        "daemon_stop",
+        &[("pid", v(std::process::id())), ("left_running", v(left))],
+    );
     Ok(())
 }
 
@@ -204,7 +199,7 @@ impl Daemon<'_> {
         match msg {
             Msg::Fs(Ok(ev)) => {
                 if ev.need_rescan() {
-                    self.force_sweep = true;
+                    self.core.force_sweep();
                 }
                 let relevant = !matches!(
                     ev.kind,
@@ -219,50 +214,49 @@ impl Daemon<'_> {
             Msg::Fs(Err(e)) => {
                 self.log
                     .event("watch_error", &[("error", v(e.to_string()))]);
-                self.force_sweep = true;
+                self.core.force_sweep();
             }
-            Msg::Done { id, step, result } => self.record(id, step, result),
+            Msg::Done {
+                id,
+                claim,
+                result,
+                files,
+                lock,
+            } => {
+                self.record(&id, &claim, result);
+                files.cleanup();
+                drop(lock);
+            }
         }
     }
 
     fn sleep_for(&self) -> Duration {
         let now = Ts::now();
-        let mut next = self.cfg.tick;
-        let mut consider = |t: Ts| {
-            let d = Duration::from_millis(t.0.saturating_sub(now.0));
-            next = next.min(d);
-        };
-        for s in self.settling.values() {
-            consider(s.deadline);
-        }
-        for e in &self.reg {
-            if let Some((_, t)) = e.next_due() {
-                consider(t);
-            }
-        }
-        next.max(Duration::from_millis(5))
+        let next = self
+            .core
+            .next_wakeup(&self.reg)
+            .map(|t| Duration::from_millis(t.0.saturating_sub(now.0)))
+            .unwrap_or(self.cfg.tick);
+        next.min(self.cfg.tick).max(Duration::from_millis(5))
     }
 
-    /// One pass of the loop (see the module docs).
-    fn pass(&mut self, schedule: bool) {
+    fn pass(&mut self) {
+        let starting = self.core.lifecycle == Lifecycle::Starting;
         self.reload();
-        self.recover_stale();
         self.sync_watches();
-        self.detect();
-        self.settle();
-        if schedule {
-            self.schedule();
-        }
-        if self.first_pass {
+        self.check_dirs();
+        self.settle_foreign_claims();
+        self.start_due();
+        self.core.end_pass();
+        if starting {
             self.log.event(
                 "ready",
                 &[
-                    ("entries", v(self.reg.len())),
+                    ("entries", v(self.reg.entries.len())),
                     ("watches", v(self.watched.len())),
                 ],
             );
         }
-        self.first_pass = false;
     }
 
     fn reload(&mut self) {
@@ -274,102 +268,58 @@ impl Daemon<'_> {
                 m.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             )
         });
-        if sig == self.reg_sig && !self.first_pass {
+        if sig.is_some() && sig == self.reg_sig {
             return;
         }
         match self.store.load() {
             Ok(reg) => {
-                self.reg = reg.entries;
+                self.reg = reg;
                 self.reg_sig = sig;
                 self.reg_error = None;
-                let ids: HashSet<&String> = self.reg.iter().map(|e| &e.id).collect();
-                self.known.retain(|id| ids.contains(id));
-                self.settling.retain(|id, _| ids.contains(id));
-                self.check_errors.retain(|id, _| ids.contains(id));
             }
-            Err(e) => {
-                let msg = format!("{e:#}");
-                if self.reg_error.as_ref() != Some(&msg) {
-                    self.log
-                        .event("registry_error", &[("error", v(msg.clone()))]);
-                    self.reg_error = Some(msg);
-                }
-            }
+            Err(e) => self.registry_error(&e),
         }
     }
 
-    /// Steps marked running by an owner that no longer exists: a previous
-    /// daemon that crashed or was killed, or an interrupted `gone run`.
-    fn recover_stale(&mut self) {
-        let me = self.pid;
-        let stale: Vec<(String, usize, u32)> = self
-            .reg
-            .iter()
-            .flat_map(|e| {
-                let mine = self.running.get(&e.id).copied();
-                e.stale_steps(|p| p != me && exec::pid_alive(p))
-                    .into_iter()
-                    .filter(move |&(i, p)| !(p == me && mine == Some(i)))
-                    .map(|(i, p)| (e.id.clone(), i, p))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        if stale.is_empty() {
-            return;
+    fn registry_error(&mut self, e: &anyhow::Error) {
+        let msg = format!("{e:#}");
+        if self.reg_error.as_ref() != Some(&msg) {
+            self.log
+                .event("registry_error", &[("error", v(msg.clone()))]);
+            self.reg_error = Some(msg);
         }
-        let policy = self.cfg.retry;
-        let now = Ts::now();
-        let res = self.store.update(|reg| {
-            let mut out = Vec::new();
-            for (id, i, pid) in &stale {
-                let Some(e) = reg.entries.iter_mut().find(|e| &e.id == id) else {
-                    continue;
-                };
-                let result = RunResult {
-                    at: now,
-                    ok: false,
-                    exit_code: None,
-                    error: Some(format!("interrupted (owner pid {pid} is gone)")),
-                    took: Dur::ZERO,
-                    output: None,
-                };
-                if let Some(f) = e.finish(*i, *pid, result, &policy, now) {
-                    out.push((e.name.clone(), e.dir.clone(), id.clone(), *i, f));
-                }
-            }
-            Ok(out)
-        });
-        match res {
-            Ok(list) => {
-                for (name, dir, id, i, f) in list {
-                    self.log.event(
-                        "step_interrupted",
-                        &[
-                            ("name", v(name.clone())),
-                            ("dir", v(dir.display().to_string())),
-                            ("id", v(short(&id))),
-                            ("step", v(i + 1)),
-                        ],
-                    );
-                    self.log_outcome(&name, &dir, &id, i, &f, None);
-                }
-            }
-            Err(e) => self
-                .log
-                .event("registry_error", &[("error", v(format!("{e:#}")))]),
+    }
+
+    fn entry(&self, id: &str) -> Option<&Entry> {
+        self.reg.entries.iter().find(|e| e.id == id)
+    }
+
+    fn fields(&self, id: &str) -> Vec<(&'static str, Value)> {
+        match self.entry(id) {
+            Some(e) => vec![
+                ("name", v(e.name.clone())),
+                ("dir", v(e.dir.display().to_string())),
+                ("id", v(short(id))),
+            ],
+            None => vec![("id", v(short(id)))],
         }
-        self.reload();
     }
 
     fn sync_watches(&mut self) {
+        if !self.cfg.inotify {
+            return;
+        }
         let mut want: HashSet<PathBuf> = HashSet::new();
-        for e in self.reg.iter().filter(|e| e.state == EntryState::Watching) {
-            let mut p = e.dir.parent();
-            while let Some(a) = p {
+        for e in self
+            .reg
+            .entries
+            .iter()
+            .filter(|e| e.state == crate::model::EntryState::Watching)
+        {
+            for a in crate::core::ancestors(&e.dir) {
                 if !want.insert(a.to_path_buf()) {
                     break; // the rest of this chain is already in
                 }
-                p = a.parent();
             }
         }
         let gone: Vec<PathBuf> = self
@@ -416,256 +366,226 @@ impl Daemon<'_> {
         }
     }
 
-    fn detect(&mut self) {
-        let sweep = self.force_sweep || self.last_sweep.elapsed() >= self.cfg.sweep_interval;
-        if sweep {
-            self.last_sweep = Instant::now();
-            self.force_sweep = false;
-        }
-        let touched = std::mem::take(&mut self.touched);
+    fn check_dirs(&mut self) {
         let now = Ts::now();
-        let mut found = Vec::new();
-        for e in self.reg.iter().filter(|e| e.state == EntryState::Watching) {
-            if self.settling.contains_key(&e.id) {
-                continue;
-            }
-            let via = if self.first_pass {
-                "startup"
-            } else if !self.known.contains(&e.id) {
-                "registered"
-            } else if touched.iter().any(|p| e.dir.starts_with(p)) {
-                "inotify"
-            } else if sweep {
-                "sweep"
-            } else {
-                continue;
-            };
-            self.known.insert(e.id.clone());
-            match presence(&e.dir) {
-                Ok(Presence::Present) => {
-                    self.check_errors.remove(&e.id);
-                }
-                Ok(Presence::Absent) => {
-                    self.check_errors.remove(&e.id);
-                    found.push((e.id.clone(), e.name.clone(), e.dir.clone(), via));
-                }
-                Err(err) => {
-                    let msg = err.to_string();
-                    if self.check_errors.get(&e.id) != Some(&msg) {
-                        self.log.event(
-                            "check_error",
-                            &[
-                                ("name", v(e.name.clone())),
-                                ("dir", v(e.dir.display().to_string())),
-                                ("error", v(msg.clone())),
-                            ],
-                        );
-                        self.check_errors.insert(e.id.clone(), msg);
-                    }
-                }
-            }
+        let touched = std::mem::take(&mut self.touched);
+        let checks = self.core.plan_checks(&self.reg, &touched, now);
+        if checks.is_empty() {
+            return;
         }
-        let settle = Dur::from_std(self.cfg.settle);
-        for (id, name, dir, via) in found {
-            self.log.event(
-                "dir_gone",
-                &[
-                    ("name", v(name)),
-                    ("dir", v(dir.display().to_string())),
-                    ("id", v(short(&id))),
-                    ("via", v(via)),
-                    ("settle", v(settle.to_string())),
-                ],
-            );
-            self.settling.insert(
-                id,
-                Settling {
-                    since: now,
-                    deadline: now.plus(settle),
-                },
-            );
+        let results: Vec<_> = checks
+            .into_iter()
+            .map(|c| {
+                let p = probe_dir(&c.dir);
+                (c, p)
+            })
+            .collect();
+        let core = &mut self.core;
+        let notes = match self
+            .store
+            .update(|reg| Ok(core.apply_checks(reg, results, now)))
+        {
+            Ok(n) => n,
+            Err(e) => {
+                self.registry_error(&e);
+                return;
+            }
+        };
+        self.reload();
+        let settle = Dur::from_std(self.cfg.settle).to_string();
+        for note in notes {
+            match note {
+                Note::Presence { id, via, notice } => {
+                    let mut f = self.fields(&id);
+                    let event = match notice {
+                        Notice::Gone { .. } => {
+                            f.push(("via", v(via)));
+                            f.push(("settle", v(settle.clone())));
+                            "dir_gone"
+                        }
+                        Notice::Cancelled => {
+                            f.push(("reason", v("dir is back")));
+                            "cancelled"
+                        }
+                        Notice::CheckError {
+                            error,
+                            interrupted_settle,
+                        } => {
+                            f.push(("error", v(error)));
+                            if interrupted_settle {
+                                f.push(("settle", v("restarts on the next absent check")));
+                            }
+                            "check_error"
+                        }
+                        Notice::Recovered => "check_ok",
+                    };
+                    self.log.event(event, &f);
+                }
+                Note::Triggered { id, gone_at } => {
+                    let mut f = self.fields(&id);
+                    let steps = self.entry(&id).map(|e| e.steps.len()).unwrap_or(0);
+                    f.push(("steps", v(steps)));
+                    f.push(("gone_at", v(gone_at.rfc3339())));
+                    self.log.event("triggered", &f);
+                }
+            }
         }
     }
 
-    fn settle(&mut self) {
+    /// Claims held by an earlier daemon or by a `gone run`: wait while the
+    /// attempt runs, then record its exit status, or an interrupted attempt
+    /// if it left none.
+    fn settle_foreign_claims(&mut self) {
         let now = Ts::now();
-        let ids: Vec<String> = self.settling.keys().cloned().collect();
-        for id in ids {
-            let Some(e) = self.reg.iter().find(|e| e.id == id) else {
-                self.settling.remove(&id);
+        for (id, step, claim) in self.core.foreign(&self.reg) {
+            let Some(gone_at) = self.entry(&id).and_then(|e| e.state.gone_at()) else {
                 continue;
             };
-            if e.state != EntryState::Watching {
-                self.settling.remove(&id);
+            let files = self.store.run_files(&id, gone_at, step, claim.attempt);
+            let probe = files.probe();
+            let mut fields = self.fields(&id);
+            fields.extend([
+                ("step", v(step + 1)),
+                ("attempt", v(claim.attempt)),
+                ("owner", v(claim.owner.describe())),
+            ]);
+            if probe == ClaimProbe::Running {
+                if self.adopted_logged.insert((id.clone(), claim.attempt)) {
+                    self.log.event("step_adopted", &fields);
+                }
+                self.enforce_timeout(&claim, &files, now);
                 continue;
             }
-            let (name, dir) = (e.name.clone(), e.dir.clone());
-            let fields = |extra: Vec<(&'static str, Value)>| {
-                let mut f = vec![
-                    ("name", v(name.clone())),
-                    ("dir", v(dir.display().to_string())),
-                    ("id", v(short(&id))),
-                ];
-                f.extend(extra);
-                f
+            let (event, result) = match &probe {
+                ClaimProbe::Exited(r) => ("step_recovered", Some(r.clone())),
+                _ => ("step_interrupted", None),
             };
-            match presence(&dir) {
-                Ok(Presence::Present) => {
-                    self.settling.remove(&id);
-                    self.log
-                        .event("cancelled", &fields(vec![("reason", v("dir is back"))]));
+            let core = &self.core;
+            match self
+                .store
+                .update(|reg| Ok(core.resolve(reg, &id, &claim, probe, now)))
+            {
+                Ok(Some(f)) => {
+                    self.log.event(event, &fields);
+                    self.log_outcome(&id, &f, result.as_ref());
+                    files.cleanup();
+                }
+                Ok(None) => {}
+                Err(e) => self.registry_error(&e),
+            }
+            self.adopted_logged.remove(&(id.clone(), claim.attempt));
+            self.reload();
+        }
+    }
+
+    /// The step timeout also applies to an adopted daemon-run attempt: TERM
+    /// its process group once over time, KILL five seconds later.
+    fn enforce_timeout(&self, claim: &Claim, files: &RunFiles, now: Ts) {
+        let (Some(limit), Owner::Daemon { .. }) = (self.cfg.step_timeout, &claim.owner) else {
+            return;
+        };
+        let over = now.since(claim.since);
+        let limit = Dur::from_std(limit);
+        if over < limit {
+            return;
+        }
+        if let Some(pgid) = files.pid() {
+            let sig = if over.0 >= limit.0 + 5000 {
+                libc::SIGKILL
+            } else {
+                libc::SIGTERM
+            };
+            exec::kill_group(pgid, sig);
+        }
+    }
+
+    fn start_due(&mut self) {
+        let now = Ts::now();
+        for (id, step, attempt) in self.core.due(&self.reg, now) {
+            let Some(gone_at) = self.entry(&id).and_then(|e| e.state.gone_at()) else {
+                continue;
+            };
+            let files = self.store.run_files(&id, gone_at, step, attempt);
+            let lock = match files.acquire() {
+                Ok(l) => l,
+                Err(e) => {
+                    let mut f = self.fields(&id);
+                    f.extend([("step", v(step + 1)), ("error", v(format!("{e:#}")))]);
+                    self.log.event("claim_error", &f);
                     continue;
                 }
-                Err(_) => continue, // unknown: keep waiting, never trigger on an error
-                Ok(Presence::Absent) => {}
-            }
-            let s = &self.settling[&id];
-            if now < s.deadline {
-                continue;
-            }
-            let since = s.since;
-            self.settling.remove(&id);
-            let res = self.store.update(|reg| {
-                Ok(reg
-                    .entries
-                    .iter_mut()
-                    .find(|e| e.id == id)
-                    .map(|e| (e.trigger(since), e.steps.len())))
-            });
-            match res {
-                Ok(Some((true, steps))) => {
-                    self.log
-                        .event("triggered", &fields(vec![("steps", v(steps))]));
-                }
-                Ok(_) => {}
-                Err(e) => self
-                    .log
-                    .event("registry_error", &[("error", v(format!("{e:#}")))]),
+            };
+            let core = &self.core;
+            let claimed = self
+                .store
+                .update(|reg| Ok(core.claim(reg, &id, step, attempt, now)));
+            match claimed {
+                Ok(Some((entry, claim))) => self.start(entry, step, claim, files, lock),
+                Ok(None) => {}
+                Err(e) => self.registry_error(&e),
             }
             self.reload();
         }
     }
 
-    fn schedule(&mut self) {
-        let now = Ts::now();
-        let due: Vec<(String, usize)> = self
-            .reg
-            .iter()
-            .filter(|e| !self.running.contains_key(&e.id))
-            .filter_map(|e| e.next_runnable(now).map(|i| (e.id.clone(), i)))
-            .collect();
-        for (id, i) in due {
-            let pid = self.pid;
-            let claimed = self.store.update(|reg| {
-                Ok(reg
-                    .entries
-                    .iter_mut()
-                    .find(|e| e.id == id)
-                    .and_then(|e| e.claim(i, pid, now).then(|| e.clone())))
-            });
-            let entry = match claimed {
-                Ok(Some(e)) => e,
-                Ok(None) => continue,
-                Err(e) => {
-                    self.log
-                        .event("registry_error", &[("error", v(format!("{e:#}")))]);
-                    continue;
-                }
-            };
-            self.start(entry, i);
-        }
-        self.reload();
-    }
-
-    fn start(&mut self, e: Entry, i: usize) {
-        let step = &e.steps[i];
-        let attempt = step.attempts + 1;
-        let output =
-            self.store
-                .runs_dir()
-                .join(format!("{}-step{}-attempt{attempt}.log", e.id, i + 1));
-        self.log.event(
-            "step_start",
-            &[
-                ("name", v(e.name.clone())),
-                ("dir", v(e.dir.display().to_string())),
-                ("id", v(short(&e.id))),
-                ("step", v(i + 1)),
-                ("attempt", v(attempt)),
-                ("program", v(step.cmd.program())),
-            ],
-        );
-        self.running.insert(e.id.clone(), i);
+    fn start(&mut self, e: Entry, step: usize, claim: Claim, files: RunFiles, lock: File) {
+        let mut f = self.fields(&e.id);
+        f.extend([
+            ("step", v(step + 1)),
+            ("attempt", v(claim.attempt)),
+            ("program", v(e.steps[step].cmd.program())),
+        ]);
+        self.log.event("step_start", &f);
         let tx = self.tx.clone();
-        let children = self.children.clone();
         let timeout = self.cfg.step_timeout;
+        let exe = self.exe.clone();
         std::thread::spawn(move || {
             let env = step_env(&e);
-            let job = Job {
-                cmd: &e.steps[i].cmd,
+            let result = exec::run(&Job {
+                cmd: &e.steps[step].cmd,
                 cwd: &e.cwd,
                 env: &env,
                 timeout,
-                output: Output::File(output),
-            };
-            let id = e.id.clone();
-            let result = exec::run(&job, |pgid| {
-                children.lock().unwrap().insert(id.clone(), pgid);
+                output: Output::File(files.output.clone()),
+                own_group: true,
+                supervised: Some(Supervised {
+                    exe: &exe,
+                    files: &files,
+                    lock: &lock,
+                }),
             });
-            children.lock().unwrap().remove(&id);
             let _ = tx.send(Msg::Done {
-                id,
-                step: i,
+                id: e.id.clone(),
+                claim,
                 result,
+                files,
+                lock,
             });
         });
     }
 
-    fn record(&mut self, id: String, step: usize, result: RunResult) {
-        self.running.remove(&id);
-        let pid = self.pid;
-        let policy = self.cfg.retry;
+    fn record(&mut self, id: &str, claim: &Claim, result: RunResult) {
         let now = Ts::now();
-        let res = self.store.update(|reg| {
-            Ok(reg.entries.iter_mut().find(|e| e.id == id).and_then(|e| {
-                let (name, dir) = (e.name.clone(), e.dir.clone());
-                e.finish(step, pid, result.clone(), &policy, now)
-                    .map(|f| (name, dir, f))
-            }))
-        });
-        match res {
-            Ok(Some((name, dir, f))) => self.log_outcome(&name, &dir, &id, step, &f, Some(&result)),
-            Ok(None) => self.log.event(
-                "result_dropped",
-                &[
-                    ("id", v(short(&id))),
-                    ("step", v(step + 1)),
-                    ("reason", v("registration was replaced or forgotten")),
-                ],
-            ),
-            Err(e) => self
-                .log
-                .event("registry_error", &[("error", v(format!("{e:#}")))]),
+        let core = &self.core;
+        let r = result.clone();
+        match self
+            .store
+            .update(|reg| Ok(core.finish(reg, id, claim, r, now)))
+        {
+            Ok(Some(f)) => self.log_outcome(id, &f, Some(&result)),
+            Ok(None) => {
+                let mut f = self.fields(id);
+                f.push(("reason", v("registration was replaced or forgotten")));
+                self.log.event("result_dropped", &f);
+            }
+            Err(e) => self.registry_error(&e),
         }
         self.reload();
     }
 
-    fn log_outcome(
-        &self,
-        name: &str,
-        dir: &Path,
-        id: &str,
-        step: usize,
-        f: &crate::model::Finished,
-        result: Option<&RunResult>,
-    ) {
-        let mut fields = vec![
-            ("name", v(name)),
-            ("dir", v(dir.display().to_string())),
-            ("id", v(short(id))),
-            ("step", v(step + 1)),
-            ("attempt", v(f.attempt)),
-        ];
+    fn log_outcome(&self, id: &str, f: &crate::model::Finished, result: Option<&RunResult>) {
+        let mut fields = self.fields(id);
+        fields.extend([("step", v(f.step + 1)), ("attempt", v(f.attempt))]);
         if let Some(r) = result {
             fields.push(("exit", r.exit_code.map(v).unwrap_or(Value::Null)));
             fields.push(("took", v(approx(r.took))));
@@ -684,25 +604,9 @@ impl Daemon<'_> {
                 self.log.event("step_failed", &fields);
             }
         }
-        if let Some(state) = &f.concluded {
-            self.log.event(
-                state.kind(),
-                &[
-                    ("name", v(name)),
-                    ("dir", v(dir.display().to_string())),
-                    ("id", v(short(id))),
-                ],
-            );
-        }
-    }
-
-    fn kill_running(&mut self) {
-        for (id, pgid) in self.children.lock().unwrap().iter() {
-            self.log.event(
-                "step_killed",
-                &[("id", v(short(id))), ("reason", v("daemon shutdown"))],
-            );
-            exec::kill_group(*pgid, libc::SIGTERM);
+        if let Some(all_ok) = f.concluded {
+            self.log
+                .event(if all_ok { "done" } else { "failed" }, &self.fields(id));
         }
     }
 
@@ -712,9 +616,11 @@ impl Daemon<'_> {
         };
         let cutoff = SystemTime::now() - Duration::from_secs(30 * 86_400);
         for f in dir.flatten() {
-            if f.metadata()
-                .and_then(|m| m.modified())
-                .is_ok_and(|t| t < cutoff)
+            let is_log = f.path().extension().is_some_and(|x| x == "log");
+            if is_log
+                && f.metadata()
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t < cutoff)
             {
                 let _ = std::fs::remove_file(f.path());
             }

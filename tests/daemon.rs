@@ -393,23 +393,74 @@ fn only_one_daemon_runs() {
 }
 
 #[test]
-fn interrupted_step_is_retried_after_a_crash() {
+fn crash_mid_step_is_adopted_not_rerun() {
     let env = Env::new();
     let wt = env.dir("wt");
+    let step = format!("{}; sleep 2", env.mark_step("m"));
+    env.watch(&wt, &["--shell", &step]);
+    let d = env.daemon(&[]);
+    std::fs::remove_dir_all(&wt).unwrap();
+    env.wait_for(WAIT, "the step to start", || env.runs("m") == 1);
+    d.crash();
+    // The step keeps running without the daemon; the next one adopts it and
+    // records its real exit status when it ends.
+    let _d = env.daemon(&[]);
+    env.wait_for(WAIT, "the step to be recorded", || {
+        env.entry_state(0) == "done"
+    });
+    assert_eq!(env.count("step_adopted"), 1);
+    assert_eq!(env.count("step_recovered"), 1);
+    assert_eq!(env.count("step_interrupted"), 0);
+    assert_eq!(env.runs("m"), 1, "not re-run");
+}
+
+#[test]
+fn lost_step_is_retried() {
+    let env = Env::new();
+    let wt = env.dir("wt");
+    let m = env.marker("m");
+    // First attempt hangs; the retry finishes at once.
     let step = format!(
-        "{}; [ \"$(wc -l < '{}')\" -gt 1 ] || sleep 3",
+        "{}; [ \"$(wc -l < '{}')\" -gt 1 ] || sleep 30",
         env.mark_step("m"),
-        env.marker("m").display()
+        m.display()
     );
     env.watch(&wt, &["--shell", &step]);
     let d = env.daemon(&[]);
     std::fs::remove_dir_all(&wt).unwrap();
     env.wait_for(WAIT, "the step to start", || env.runs("m") == 1);
     d.crash();
+    // Now the step dies too, without leaving a status (as on a reboot).
+    let pgid = env.step_pgid();
+    // SAFETY: plain syscall on the test's own process group.
+    unsafe { libc::kill(-pgid, libc::SIGKILL) };
     let _d = env.daemon(&[]);
     env.wait_for(WAIT, "the retry to finish", || env.entry_state(0) == "done");
     assert_eq!(env.count("step_interrupted"), 1);
-    assert_eq!(env.runs("m"), 2);
+    assert_eq!(env.runs("m"), 2, "the lost attempt is retried");
+}
+
+#[test]
+fn periodic_sweep_catches_a_delete_without_events() {
+    let env = Env::new();
+    let gone = env.dir("gone");
+    let kept = env.dir("kept");
+    env.watch(&gone, &["--shell", &env.mark_step("gone")]);
+    env.watch(&kept, &["--shell", &env.mark_step("kept")]);
+    // No inotify at all: only the sweep can notice.
+    let _d = env.daemon(&["--no-inotify", "--sweep-interval", "1s"]);
+    std::fs::remove_dir_all(&gone).unwrap();
+    env.wait_for(WAIT, "the sweep to catch it", || env.runs("gone") == 1);
+    assert!(
+        env.events()
+            .iter()
+            .any(|e| e["event"] == "dir_gone" && e["via"] == "sweep")
+    );
+    env.stays(
+        Duration::from_millis(2500),
+        "the present dir left alone",
+        || env.runs("kept") == 0,
+    );
 }
 
 #[test]

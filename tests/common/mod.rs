@@ -121,7 +121,7 @@ impl Env {
             .cmd()
             .args(&args)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(self.daemon_stderr())
             .spawn()
             .unwrap();
         let d = Daemon { child: Some(child) };
@@ -132,6 +132,15 @@ impl Env {
                 .any(|e| e["event"] == "ready")
         });
         d
+    }
+
+    /// Daemon stderr, appended across restarts, shown when a wait times out.
+    fn daemon_stderr(&self) -> std::fs::File {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root().join("daemon.stderr"))
+            .unwrap()
     }
 
     pub fn events(&self) -> Vec<Value> {
@@ -151,11 +160,20 @@ impl Env {
         serde_json::from_str(&text).expect("registry is valid JSON")
     }
 
+    /// `watching`, `triggered`, `done` or `failed`, as `gone list` says it.
     pub fn entry_state(&self, i: usize) -> String {
-        self.registry()["entries"][i]["state"]["kind"]
-            .as_str()
-            .unwrap()
-            .to_string()
+        let st = &self.registry()["entries"][i]["state"];
+        match st["kind"].as_str().unwrap() {
+            "finished" => {
+                let all_ok = st["steps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|r| r["result"]["ok"] == true);
+                if all_ok { "done" } else { "failed" }.to_string()
+            }
+            other => other.to_string(),
+        }
     }
 
     pub fn wait_for(&self, timeout: Duration, what: &str, mut cond: impl FnMut() -> bool) {
@@ -163,12 +181,27 @@ impl Env {
         while !cond() {
             if start.elapsed() > timeout {
                 panic!(
-                    "timed out after {timeout:?} waiting for {what}\nevents:\n{}",
-                    self.ok(&["log", "-n", "0"])
+                    "timed out after {timeout:?} waiting for {what}\nevents:\n{}\ndaemon stderr:\n{}",
+                    self.ok(&["log", "-n", "0"]),
+                    std::fs::read_to_string(self.root().join("daemon.stderr")).unwrap_or_default()
                 );
             }
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    /// The process group of the step running now (its supervisor's pid,
+    /// written into the attempt's run lock).
+    pub fn step_pgid(&self) -> i32 {
+        let runs = self.state().join("runs");
+        for f in std::fs::read_dir(runs).unwrap().flatten() {
+            if f.path().extension().is_some_and(|x| x == "lock")
+                && let Ok(pid) = std::fs::read_to_string(f.path()).unwrap().trim().parse()
+            {
+                return pid;
+            }
+        }
+        panic!("no running step");
     }
 
     /// Waits a while and asserts `cond` stays true the whole time.

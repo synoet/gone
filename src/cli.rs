@@ -72,6 +72,17 @@ pub enum Command {
         #[command(subcommand)]
         command: ServiceCommand,
     },
+    /// Internal: runs one step attempt, holding its run lock, and records
+    /// its exit status (see `exec::supervise`).
+    #[command(name = "__supervise", hide = true)]
+    Supervise {
+        #[arg(long)]
+        status: PathBuf,
+        #[arg(long)]
+        lock_fd: i32,
+        #[arg(last = true, required = true)]
+        argv: Vec<OsString>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -153,6 +164,10 @@ pub struct DaemonArgs {
     /// On SIGTERM, how long to wait for running steps.
     #[arg(long, default_value = "30s", value_parser = Dur::parse)]
     pub shutdown_grace: Dur,
+    /// Don't use inotify; notice deletes only by sweeping (for filesystems
+    /// where inotify misses changes, e.g. NFS).
+    #[arg(long)]
+    pub no_inotify: bool,
     /// Longest the loop sleeps between passes.
     #[arg(long, default_value = "1s", value_parser = Dur::parse, hide = true)]
     pub tick: Dur,

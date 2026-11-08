@@ -4,9 +4,12 @@
 
 pub mod cli;
 pub mod commands;
+pub mod core;
 pub mod daemon;
 pub mod events;
 pub mod exec;
+pub mod migrate;
 pub mod model;
+pub mod presence;
 pub mod store;
 pub mod time;
